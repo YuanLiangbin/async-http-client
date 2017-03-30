@@ -16,6 +16,7 @@ package org.asynchttpclient.netty;
 import static org.asynchttpclient.util.DateUtils.unpreciseMillisTime;
 import io.netty.channel.Channel;
 
+import java.io.IOException;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
@@ -33,6 +34,7 @@ import org.asynchttpclient.Request;
 import org.asynchttpclient.channel.ChannelPoolPartitioning;
 import org.asynchttpclient.netty.channel.ChannelState;
 import org.asynchttpclient.netty.channel.Channels;
+import org.asynchttpclient.netty.channel.ConnectionSemaphore;
 import org.asynchttpclient.netty.request.NettyRequest;
 import org.asynchttpclient.netty.timeout.TimeoutsHolder;
 import org.asynchttpclient.proxy.ProxyServer;
@@ -56,6 +58,7 @@ public final class NettyResponseFuture<V> implements ListenableFuture<V> {
 
     private final long start = unpreciseMillisTime();
     private final ChannelPoolPartitioning connectionPoolPartitioning;
+    private final ConnectionSemaphore connectionSemaphore;
     private final ProxyServer proxyServer;
     private final int maxRetry;
     private final CompletableFuture<V> future = new CompletableFuture<>();
@@ -73,6 +76,8 @@ public final class NettyResponseFuture<V> implements ListenableFuture<V> {
     private volatile int onThrowableCalled = 0;
     @SuppressWarnings("unused")
     private volatile TimeoutsHolder timeoutsHolder;
+    // partition key, when != null used to release lock in ChannelManager
+    private volatile Object partitionKeyLock;
 
     @SuppressWarnings("rawtypes")
     private static final AtomicIntegerFieldUpdater<NettyResponseFuture> isDoneField = AtomicIntegerFieldUpdater.newUpdater(NettyResponseFuture.class, "isDone");
@@ -90,6 +95,8 @@ public final class NettyResponseFuture<V> implements ListenableFuture<V> {
     private static final AtomicIntegerFieldUpdater<NettyResponseFuture> onThrowableCalledField = AtomicIntegerFieldUpdater.newUpdater(NettyResponseFuture.class, "onThrowableCalled");
     @SuppressWarnings("rawtypes")
     private static final AtomicReferenceFieldUpdater<NettyResponseFuture, TimeoutsHolder> timeoutsHolderField = AtomicReferenceFieldUpdater.newUpdater(NettyResponseFuture.class, TimeoutsHolder.class, "timeoutsHolder");
+    @SuppressWarnings("rawtypes")
+    private static final AtomicReferenceFieldUpdater<NettyResponseFuture, Object> partitionKeyLockField = AtomicReferenceFieldUpdater.newUpdater(NettyResponseFuture.class, Object.class, "partitionKeyLock");
 
     // volatile where we need CAS ops
     private volatile int redirectCount = 0;
@@ -120,14 +127,34 @@ public final class NettyResponseFuture<V> implements ListenableFuture<V> {
             NettyRequest nettyRequest,//
             int maxRetry,//
             ChannelPoolPartitioning connectionPoolPartitioning,//
+            ConnectionSemaphore connectionSemaphore,//
             ProxyServer proxyServer) {
 
         this.asyncHandler = asyncHandler;
         this.targetRequest = currentRequest = originalRequest;
         this.nettyRequest = nettyRequest;
         this.connectionPoolPartitioning = connectionPoolPartitioning;
+        this.connectionSemaphore = connectionSemaphore;
         this.proxyServer = proxyServer;
         this.maxRetry = maxRetry;
+    }
+
+    private void releasePartitionKeyLock() {
+        Object partitionKey = takePartitionKeyLock();
+        if (partitionKey != null) {
+            connectionSemaphore.releaseChannelLock(partitionKey);
+        }
+    }
+
+    // Take partition key lock object,
+    // but do not release channel lock.
+    public Object takePartitionKeyLock() {
+        // shortcut, much faster than getAndSet
+        if (partitionKeyLock == null) {
+            return null;
+        }
+
+        return partitionKeyLockField.getAndSet(this, null);
     }
 
     // java.util.concurrent.Future
@@ -144,6 +171,7 @@ public final class NettyResponseFuture<V> implements ListenableFuture<V> {
 
     @Override
     public boolean cancel(boolean force) {
+        releasePartitionKeyLock();
         cancelTimeouts();
 
         if (isCancelledField.getAndSet(this, 1) != 0)
@@ -212,6 +240,7 @@ public final class NettyResponseFuture<V> implements ListenableFuture<V> {
     // org.asynchttpclient.ListenableFuture
 
     private boolean terminateAndExit() {
+        releasePartitionKeyLock();
         cancelTimeouts();
         this.channel = null;
         this.reuseChannel = false;
@@ -458,6 +487,29 @@ public final class NettyResponseFuture<V> implements ListenableFuture<V> {
 
     public Object getPartitionKey() {
         return connectionPoolPartitioning.getPartitionKey(targetRequest.getUri(), targetRequest.getVirtualHost(), proxyServer);
+    }
+
+    public void acquirePartitionLockLazily() throws IOException {
+        if (partitionKeyLock != null) {
+            return;
+        }
+
+        Object partitionKey = getPartitionKey();
+        connectionSemaphore.acquireChannelLock(partitionKey);
+        Object prevKey = partitionKeyLockField.getAndSet(this, partitionKey);
+        if (prevKey != null) {
+            // self-check
+
+            connectionSemaphore.releaseChannelLock(prevKey);
+            releasePartitionKeyLock();
+
+            throw new IllegalStateException("Trying to acquire partition lock concurrently. Please report.");
+        }
+
+        if (isDone()) {
+            // may be cancelled while we acquired a lock
+            releasePartitionKeyLock();
+        }
     }
 
     public Realm getRealm() {
